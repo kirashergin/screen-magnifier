@@ -18,48 +18,51 @@
 
 // ── Config ──────────────────────────────────────────────────────────────
 static int   g_diameter   = 300;
-static int   g_border     = 4;          // visual border width
+static int   g_border     = 4;
 static float g_zoom       = 2.0f;
 static const float ZOOM_MIN = 1.0f;
 static const float ZOOM_MAX = 8.0f;
 
 // ── Refresh ─────────────────────────────────────────────────────────────
-static const UINT FPS_INTERVAL = 16;    // ~60 FPS always
+static const UINT FPS_INTERVAL = 16;    // ~60 FPS
 
 // ── Globals ─────────────────────────────────────────────────────────────
 static HWND    g_hWnd       = nullptr;
 static int     g_winX, g_winY;
 static bool    g_visible    = true;
 
-// Mouse hook for drag (left-click + right-click)
+// Mouse hook
 static HHOOK   g_mouseHook  = nullptr;
 static bool    g_dragging   = false;
-static bool    g_dragConfirmed = false;  // true after movement exceeds threshold
-static bool    g_dragIsLeft = false;     // which button started the drag
+static bool    g_dragConfirmed = false;
+static bool    g_dragIsLeft = false;
 static POINT   g_dragStart  = {};
 static int     g_dragWinX, g_dragWinY;
-static const int DRAG_THRESHOLD = 5;    // px before drag activates (avoids eating clicks)
+static const int DRAG_THRESHOLD = 5;
 
 // Zoom tracking
 static float   g_lastRenderedZoom = 0;
 
+// Capture mode: false = WDA_EXCLUDEFROMCAPTURE, true = per-window capture
+static bool    g_useFallback = false;
+
 // Cached GDI
-static HDC     g_hScreenDC  = nullptr;  // cached screen DC
-static HDC     g_hMemDC     = nullptr;  // final compositing DC
+static HDC     g_hScreenDC  = nullptr;
+static HDC     g_hMemDC     = nullptr;
 static HBITMAP g_hDIB       = nullptr;
 static void*   g_pBits      = nullptr;
-static HDC     g_hCapDC     = nullptr;  // screen capture DC
+static HDC     g_hCapDC     = nullptr;  // zoomed capture (d x d)
 static HBITMAP g_hCapBmp    = nullptr;
-static HDC     g_hBorderDC  = nullptr;  // cached border overlay
+static HDC     g_hCompDC    = nullptr;  // 1:1 composition buffer (d x d max)
+static HBITMAP g_hCompBmp   = nullptr;
+static HDC     g_hBorderDC  = nullptr;
 static HBITMAP g_hBorderBmp = nullptr;
 static void*   g_pBorderBits = nullptr;
 static bool    g_borderDirty = true;
 
-// Pre-computed circular alpha mask (g_diameter * g_diameter bytes)
+// Circle mask
 static BYTE*   g_circleMask = nullptr;
-
-// Pre-computed per-row circle spans (first/last opaque pixel)
-struct RowSpan { int x0, x1; };  // [x0, x1) range where mask > 0
+struct RowSpan { int x0, x1; };
 static RowSpan* g_rowSpans  = nullptr;
 
 // Hotkey / timer IDs
@@ -79,28 +82,119 @@ void DestroyCachedResources();
 void RenderBorderCache();
 void BuildCircleMask();
 void CaptureAndRender();
+void CaptureByWindowEnum(int cx, int cy, int srcSize);
 bool IsPointInLens(int px, int py);
 
 // ── Config file loading ──────────────────────────────────────────────────
 void LoadConfig() {
     wchar_t iniPath[MAX_PATH];
     GetModuleFileNameW(nullptr, iniPath, MAX_PATH);
-    // Replace .exe with .ini (config.ini next to magnifier.exe)
     wchar_t* lastSlash = wcsrchr(iniPath, L'\\');
     if (lastSlash) wcscpy(lastSlash + 1, L"config.ini");
     else wcscpy(iniPath, L"config.ini");
 
-    // Read values (GetPrivateProfileInt returns default if missing)
     int d = GetPrivateProfileIntW(L"magnifier", L"diameter", g_diameter, iniPath);
     if (d >= 100 && d <= 1000) g_diameter = d;
 
     int b = GetPrivateProfileIntW(L"magnifier", L"border", g_border, iniPath);
     if (b >= 1 && b <= 20) g_border = b;
 
-    // Read zoom as integer x100 (e.g. 200 = 2.0x)
     int z = GetPrivateProfileIntW(L"magnifier", L"zoom_x100", (int)(g_zoom * 100), iniPath);
     float zf = z / 100.0f;
     if (zf >= ZOOM_MIN && zf <= ZOOM_MAX) g_zoom = zf;
+}
+
+// ── Per-window screen capture (fallback for Win10 < 2004) ───────────────
+// Reconstructs the screen image by compositing individual window DCs,
+// skipping our own lens window. No flicker, no offset, no API version req.
+
+struct WndEnumData {
+    HWND excludeWnd;
+    RECT srcRect;
+    HWND windows[128];
+    int count;
+};
+
+static BOOL CALLBACK CollectWindows(HWND hwnd, LPARAM lP) {
+    auto* data = (WndEnumData*)lP;
+    if (hwnd == data->excludeWnd) return TRUE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+
+    // Skip cloaked windows (hidden UWP apps, virtual desktops)
+    DWORD cloaked = 0;
+    DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    if (cloaked) return TRUE;
+
+    RECT wr;
+    GetWindowRect(hwnd, &wr);
+
+    RECT inter;
+    if (IntersectRect(&inter, &wr, &data->srcRect)) {
+        if (data->count < 128)
+            data->windows[data->count++] = hwnd;
+    }
+    return TRUE;
+}
+
+void CaptureByWindowEnum(int cx, int cy, int srcSize) {
+    int d = g_diameter;
+    RECT srcRect = {
+        cx - srcSize / 2,
+        cy - srcSize / 2,
+        cx - srcSize / 2 + srcSize,
+        cy - srcSize / 2 + srcSize
+    };
+
+    // 1. Desktop wallpaper + icons (Progman is always at the bottom)
+    HWND hProgman = FindWindow(L"Progman", nullptr);
+    if (hProgman) {
+        HDC hDeskDC = GetWindowDC(hProgman);
+        if (hDeskDC) {
+            BitBlt(g_hCompDC, 0, 0, srcSize, srcSize,
+                   hDeskDC, srcRect.left, srcRect.top, SRCCOPY);
+            ReleaseDC(hProgman, hDeskDC);
+        }
+    } else {
+        RECT r = { 0, 0, srcSize, srcSize };
+        FillRect(g_hCompDC, &r, (HBRUSH)(COLOR_DESKTOP + 1));
+    }
+
+    // 2. Collect visible windows overlapping source rect (top→bottom Z-order)
+    WndEnumData data = {};
+    data.excludeWnd = g_hWnd;
+    data.srcRect = srcRect;
+    EnumWindows(CollectWindows, (LPARAM)&data);
+
+    // 3. Composite bottom→top (reverse enumeration order)
+    for (int i = data.count - 1; i >= 0; i--) {
+        HWND hwnd = data.windows[i];
+        RECT wr;
+        GetWindowRect(hwnd, &wr);
+
+        RECT inter;
+        if (!IntersectRect(&inter, &wr, &srcRect)) continue;
+
+        int wxSrc = inter.left - wr.left;
+        int wySrc = inter.top  - wr.top;
+        int w     = inter.right  - inter.left;
+        int h     = inter.bottom - inter.top;
+        int dstX  = inter.left - srcRect.left;
+        int dstY  = inter.top  - srcRect.top;
+
+        HDC hWndDC = GetWindowDC(hwnd);
+        if (hWndDC) {
+            BitBlt(g_hCompDC, dstX, dstY, w, h,
+                   hWndDC, wxSrc, wySrc, SRCCOPY);
+            ReleaseDC(hwnd, hWndDC);
+        }
+    }
+
+    // 4. Zoom: composition buffer (srcSize²) → capture buffer (d²)
+    SetStretchBltMode(g_hCapDC, HALFTONE);
+    SetBrushOrgEx(g_hCapDC, 0, 0, nullptr);
+    StretchBlt(g_hCapDC, 0, 0, d, d,
+               g_hCompDC, 0, 0, srcSize, srcSize,
+               SRCCOPY);
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
@@ -125,7 +219,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_winX = (sx - g_diameter) / 2;
     g_winY = (sy - g_diameter) / 2;
 
-    // Layered + fully click-through + topmost
     g_hWnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -134,14 +227,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         g_winX, g_winY, g_diameter, g_diameter,
         nullptr, nullptr, hInst, nullptr);
 
-    // Exclude from screen capture — no hide/show flicker
-    SetWindowDisplayAffinity(g_hWnd, WDA_EXCLUDEFROMCAPTURE);
+    // Try modern API (Win10 2004+); fall back to per-window capture
+    if (!SetWindowDisplayAffinity(g_hWnd, WDA_EXCLUDEFROMCAPTURE)) {
+        g_useFallback = true;
+    }
 
-    // Disable DWM shadow around the window rectangle
     DWMNCRENDERINGPOLICY ncrp = DWMNCRP_DISABLED;
     DwmSetWindowAttribute(g_hWnd, DWMWA_NCRENDERING_POLICY, &ncrp, sizeof(ncrp));
 
-    // Install low-level mouse hook for right-click drag
     g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, hInst, 0);
 
     RegisterHotKey(g_hWnd, HK_TOGGLE,   MOD_CONTROL | MOD_ALT, 'M');
@@ -177,14 +270,13 @@ bool IsPointInLens(int px, int py) {
     return (dx * dx + dy * dy) <= (g_diameter / 2.0f) * (g_diameter / 2.0f);
 }
 
-// ── Low-level mouse hook: left/right-click drag + wheel zoom ─────────────
+// ── Low-level mouse hook ────────────────────────────────────────────────
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wP, LPARAM lP) {
     if (nCode >= 0 && g_visible) {
         MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lP;
 
         switch (wP) {
         case WM_LBUTTONDOWN:
-            // Left-click on lens: start potential drag (confirmed after threshold)
             if (!g_dragging && IsPointInLens(ms->pt.x, ms->pt.y)) {
                 g_dragging      = true;
                 g_dragConfirmed = false;
@@ -192,7 +284,6 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wP, LPARAM lP) {
                 g_dragStart     = ms->pt;
                 g_dragWinX      = g_winX;
                 g_dragWinY      = g_winY;
-                // Don't suppress yet — if no drag, we replay
                 return 1;
             }
             break;
@@ -200,7 +291,7 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wP, LPARAM lP) {
         case WM_RBUTTONDOWN:
             if (!g_dragging && IsPointInLens(ms->pt.x, ms->pt.y)) {
                 g_dragging      = true;
-                g_dragConfirmed = true;  // right-click always drags immediately
+                g_dragConfirmed = true;
                 g_dragIsLeft    = false;
                 g_dragStart     = ms->pt;
                 g_dragWinX      = g_winX;
@@ -213,16 +304,12 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wP, LPARAM lP) {
             if (g_dragging) {
                 int dx = ms->pt.x - g_dragStart.x;
                 int dy = ms->pt.y - g_dragStart.y;
-
                 if (!g_dragConfirmed) {
-                    // Check threshold before committing to drag
-                    if (abs(dx) >= DRAG_THRESHOLD || abs(dy) >= DRAG_THRESHOLD) {
+                    if (abs(dx) >= DRAG_THRESHOLD || abs(dy) >= DRAG_THRESHOLD)
                         g_dragConfirmed = true;
-                    } else {
-                        break;  // not yet — let CallNextHookEx pass it through
-                    }
+                    else
+                        break;
                 }
-
                 g_winX = g_dragWinX + dx;
                 g_winY = g_dragWinY + dy;
                 SetWindowPos(g_hWnd, nullptr, g_winX, g_winY, 0, 0,
@@ -233,44 +320,28 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wP, LPARAM lP) {
         case WM_LBUTTONUP:
             if (g_dragging && g_dragIsLeft) {
                 bool wasDrag = g_dragConfirmed;
-                g_dragging      = false;
+                g_dragging = false;
                 g_dragConfirmed = false;
-                if (!wasDrag) {
-                    // Threshold not reached — replay as a normal click-through
-                    // Send synthetic click at the original point
-                    INPUT inputs[2] = {};
-                    inputs[0].type = INPUT_MOUSE;
-                    inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-                    inputs[1].type = INPUT_MOUSE;
-                    inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                    // Temporarily unhook to avoid re-intercepting our own synthetic click
-                    // Actually, just let it pass — the next hook call will see
-                    // the cursor is still in the lens, but g_dragging is false
-                    // and this will just create a loop. Instead, use a flag.
-                    break;  // don't suppress — let the up event pass through
-                }
+                if (!wasDrag) break;
                 return 1;
             }
             break;
 
         case WM_RBUTTONUP:
             if (g_dragging && !g_dragIsLeft) {
-                g_dragging      = false;
+                g_dragging = false;
                 g_dragConfirmed = false;
                 return 1;
             }
             break;
 
-        // Mouse wheel on lens → zoom
         case WM_MOUSEWHEEL:
             if (IsPointInLens(ms->pt.x, ms->pt.y)) {
                 short delta = (short)HIWORD(ms->mouseData);
                 float oldZoom = g_zoom;
                 if (delta > 0 && g_zoom < ZOOM_MAX) g_zoom += 0.25f;
                 if (delta < 0 && g_zoom > ZOOM_MIN) g_zoom -= 0.25f;
-                if (g_zoom != oldZoom) {
-                    g_borderDirty = true;
-                }
+                if (g_zoom != oldZoom) g_borderDirty = true;
                 return 1;
             }
             break;
@@ -282,7 +353,7 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wP, LPARAM lP) {
 // ── GDI resources ───────────────────────────────────────────────────────
 void CreateCachedResources() {
     DestroyCachedResources();
-    g_hScreenDC = GetDC(nullptr);  // cache — released in Destroy
+    g_hScreenDC = GetDC(nullptr);
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
@@ -297,15 +368,20 @@ void CreateCachedResources() {
     g_hMemDC = CreateCompatibleDC(g_hScreenDC);
     SelectObject(g_hMemDC, g_hDIB);
 
-    // Border cache DIB (32-bit ARGB)
+    // Border cache DIB
     g_hBorderBmp = CreateDIBSection(g_hScreenDC, &bmi, DIB_RGB_COLORS, &g_pBorderBits, nullptr, 0);
     g_hBorderDC  = CreateCompatibleDC(g_hScreenDC);
     SelectObject(g_hBorderDC, g_hBorderBmp);
 
-    // Screen capture buffer (DDB — compatible with screen for reliable StretchBlt)
+    // Zoomed capture buffer (DDB)
     g_hCapBmp = CreateCompatibleBitmap(g_hScreenDC, g_diameter, g_diameter);
     g_hCapDC  = CreateCompatibleDC(g_hScreenDC);
     SelectObject(g_hCapDC, g_hCapBmp);
+
+    // 1:1 composition buffer for per-window capture (max srcSize = d at zoom 1x)
+    g_hCompBmp = CreateCompatibleBitmap(g_hScreenDC, g_diameter, g_diameter);
+    g_hCompDC  = CreateCompatibleDC(g_hScreenDC);
+    SelectObject(g_hCompDC, g_hCompBmp);
 
     BuildCircleMask();
     g_borderDirty = true;
@@ -318,6 +394,8 @@ void DestroyCachedResources() {
     if (g_hBorderBmp) { DeleteObject(g_hBorderBmp);  g_hBorderBmp = nullptr; }
     if (g_hCapDC)     { DeleteDC(g_hCapDC);          g_hCapDC     = nullptr; }
     if (g_hCapBmp)    { DeleteObject(g_hCapBmp);     g_hCapBmp    = nullptr; }
+    if (g_hCompDC)    { DeleteDC(g_hCompDC);         g_hCompDC    = nullptr; }
+    if (g_hCompBmp)   { DeleteObject(g_hCompBmp);    g_hCompBmp   = nullptr; }
     if (g_hScreenDC)  { ReleaseDC(nullptr, g_hScreenDC); g_hScreenDC = nullptr; }
     delete[] g_circleMask; g_circleMask = nullptr;
     delete[] g_rowSpans;   g_rowSpans   = nullptr;
@@ -341,24 +419,17 @@ void BuildCircleMask() {
             float dx = x + 0.5f - r;
             float dist = sqrtf(dx * dx + dy * dy);
             BYTE a;
-            if (dist <= innerR - 0.5f) {
-                a = 255;
-            } else if (dist >= innerR + 0.5f) {
-                a = 0;
-            } else {
-                a = (BYTE)((innerR + 0.5f - dist) * 255.0f);
-            }
+            if (dist <= innerR - 0.5f)      a = 255;
+            else if (dist >= innerR + 0.5f)  a = 0;
+            else a = (BYTE)((innerR + 0.5f - dist) * 255.0f);
             g_circleMask[y * d + x] = a;
-            if (a > 0) {
-                if (x < x0) x0 = x;
-                x1 = x + 1;
-            }
+            if (a > 0) { if (x < x0) x0 = x; x1 = x + 1; }
         }
         g_rowSpans[y] = { x0, x1 };
     }
 }
 
-// ── Pre-render border overlay (only when zoom changes) ──────────────────
+// ── Pre-render border overlay ───────────────────────────────────────────
 void RenderBorderCache() {
     Gdiplus::Graphics gfx(g_hBorderDC);
     gfx.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
@@ -367,30 +438,24 @@ void RenderBorderCache() {
     float d = (float)g_diameter;
     float b = (float)g_border;
 
-    // Outer shadow ring
     Gdiplus::Pen shadowPen(Gdiplus::Color(80, 0, 0, 0), 6.0f);
     gfx.DrawEllipse(&shadowPen, 3.0f, 3.0f, d - 6.0f, d - 6.0f);
 
-    // Main border
     Gdiplus::Pen borderPen(Gdiplus::Color(230, 30, 30, 30), b);
     float bh = b / 2.0f;
     gfx.DrawEllipse(&borderPen, bh, bh, d - b, d - b);
 
-    // Inner highlight
     Gdiplus::Pen innerPen(Gdiplus::Color(50, 255, 255, 255), 1.0f);
     gfx.DrawEllipse(&innerPen, b, b, d - 2 * b, d - 2 * b);
 
-    // Outer highlight
     Gdiplus::Pen outerPen(Gdiplus::Color(70, 255, 255, 255), 1.0f);
     gfx.DrawEllipse(&outerPen, 0.5f, 0.5f, d - 1.0f, d - 1.0f);
 
-    // Crosshair
     float mid = d / 2.0f;
     Gdiplus::Pen crossPen(Gdiplus::Color(90, 255, 50, 50), 1.0f);
     gfx.DrawLine(&crossPen, mid - 7, mid, mid + 7, mid);
     gfx.DrawLine(&crossPen, mid, mid - 7, mid, mid + 7);
 
-    // Zoom label (top-center)
     wchar_t zoomText[16];
     _snwprintf(zoomText, 16, L"%.1fx", g_zoom);
     Gdiplus::Font font(L"Segoe UI", 7.5f, Gdiplus::FontStyleBold);
@@ -399,12 +464,10 @@ void RenderBorderCache() {
     Gdiplus::StringFormat sf;
     sf.SetAlignment(Gdiplus::StringAlignmentCenter);
     sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    // Background pill for text
     Gdiplus::RectF pillRect(mid - 18, b + 2, 36.0f, 14.0f);
     gfx.FillRectangle(&textBg, pillRect);
     gfx.DrawString(zoomText, -1, &font, pillRect, &sf, &textBrush);
 
-    // Right-click hint (bottom-center)
     Gdiplus::Font hintFont(L"Segoe UI", 6.5f, Gdiplus::FontStyleRegular);
     Gdiplus::SolidBrush hintBrush(Gdiplus::Color(120, 255, 255, 255));
     Gdiplus::RectF hintRect(mid - 30, d - b - 16, 60.0f, 14.0f);
@@ -420,36 +483,34 @@ void CaptureAndRender() {
     if (!g_visible) return;
 
     int d = g_diameter;
-
-    // Get cursor position in physical screen coordinates
-    POINT cursorPt;
-    GetCursorPos(&cursorPt);
-    // Use physical coordinates for the lens center (consistent with window pos)
     int cx = g_winX + d / 2;
     int cy = g_winY + d / 2;
     int srcSize = (int)(d / g_zoom);
+    if (srcSize < 1) srcSize = 1;
 
-    // 1. Capture screen → DDB, then BitBlt into output DIB
-    // Use fresh screen DC each frame to handle monitor/DPI changes
-    HDC hScreen = GetDC(nullptr);
-    SetStretchBltMode(g_hCapDC, HALFTONE);
-    SetBrushOrgEx(g_hCapDC, 0, 0, nullptr);
-    StretchBlt(g_hCapDC, 0, 0, d, d,
-               hScreen,
-               cx - srcSize / 2, cy - srcSize / 2, srcSize, srcSize,
-               SRCCOPY);
-    ReleaseDC(nullptr, hScreen);
-    BitBlt(g_hMemDC, 0, 0, d, d, g_hCapDC, 0, 0, SRCCOPY);
-
-    // 2. Update border cache if needed
-    if (g_borderDirty || g_lastRenderedZoom != g_zoom) {
-        RenderBorderCache();
+    if (g_useFallback) {
+        // Per-window capture: no self-capture, no flicker
+        CaptureByWindowEnum(cx, cy, srcSize);
+    } else {
+        // Direct screen capture (WDA_EXCLUDEFROMCAPTURE active)
+        HDC hScreen = GetDC(nullptr);
+        SetStretchBltMode(g_hCapDC, HALFTONE);
+        SetBrushOrgEx(g_hCapDC, 0, 0, nullptr);
+        StretchBlt(g_hCapDC, 0, 0, d, d,
+                   hScreen,
+                   cx - srcSize / 2, cy - srcSize / 2, srcSize, srcSize,
+                   SRCCOPY);
+        ReleaseDC(nullptr, hScreen);
     }
 
-    // 3. Single-pass in-place: apply circle mask + composite border
-    //    Only process rows that intersect the circle; zero the rest.
+    BitBlt(g_hMemDC, 0, 0, d, d, g_hCapDC, 0, 0, SRCCOPY);
+
+    if (g_borderDirty || g_lastRenderedZoom != g_zoom)
+        RenderBorderCache();
+
+    // Apply circle mask + composite border
     {
-        DWORD* px       = (DWORD*)g_pBits;
+        DWORD* px        = (DWORD*)g_pBits;
         const DWORD* brd = (const DWORD*)g_pBorderBits;
         const BYTE*  mask = g_circleMask;
 
@@ -458,56 +519,43 @@ void CaptureAndRender() {
             int x0 = g_rowSpans[y].x0;
             int x1 = g_rowSpans[y].x1;
 
-            if (x0 >= x1) {
-                memset(px + rowOff, 0, d * 4);
-                continue;
-            }
-            if (x0 > 0)
-                memset(px + rowOff, 0, x0 * 4);
-            if (x1 < d)
-                memset(px + rowOff + x1, 0, (d - x1) * 4);
+            if (x0 >= x1) { memset(px + rowOff, 0, d * 4); continue; }
+            if (x0 > 0)   memset(px + rowOff, 0, x0 * 4);
+            if (x1 < d)   memset(px + rowOff + x1, 0, (d - x1) * 4);
 
             for (int x = x0; x < x1; x++) {
                 int idx = rowOff + x;
                 BYTE ma = mask[idx];
 
-                // Read captured pixel (already in output DIB from BitBlt)
                 DWORD cpx = px[idx];
                 BYTE cr = (BYTE)(cpx);
                 BYTE cg = (BYTE)(cpx >> 8);
                 BYTE cb = (BYTE)(cpx >> 16);
                 BYTE dr, dg, db, da;
 
-                if (ma == 255) {
-                    dr = cr; dg = cg; db = cb; da = 255;
-                } else {
+                if (ma == 255) { dr = cr; dg = cg; db = cb; da = 255; }
+                else {
                     dr = (BYTE)((cr * ma) / 255);
                     dg = (BYTE)((cg * ma) / 255);
                     db = (BYTE)((cb * ma) / 255);
                     da = ma;
                 }
 
-                // Blend border overlay on top
                 DWORD bpx = brd[idx];
                 BYTE sa = (BYTE)(bpx >> 24);
                 if (sa > 0) {
-                    if (sa == 255) {
-                        px[idx] = bpx;
-                        continue;
-                    }
+                    if (sa == 255) { px[idx] = bpx; continue; }
                     BYTE invSa = 255 - sa;
                     dr = (BYTE)(((BYTE)(bpx)      * sa + dr * invSa) / 255);
                     dg = (BYTE)(((BYTE)(bpx >> 8)  * sa + dg * invSa) / 255);
                     db = (BYTE)(((BYTE)(bpx >> 16) * sa + db * invSa) / 255);
                     da = (BYTE)(sa + (da * invSa) / 255);
                 }
-
                 px[idx] = dr | (dg << 8) | (db << 16) | (da << 24);
             }
         }
     }
 
-    // 4. Push to layered window
     POINT ptPos = { g_winX, g_winY };
     SIZE sz     = { d, d };
     POINT ptSrc = { 0, 0 };
@@ -518,11 +566,8 @@ void CaptureAndRender() {
 // ── Window procedure ────────────────────────────────────────────────────
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wP, LPARAM lP) {
     switch (msg) {
-
     case WM_TIMER:
-        if (wP == TIMER_REFRESH) {
-            CaptureAndRender();
-        }
+        if (wP == TIMER_REFRESH) CaptureAndRender();
         return 0;
 
     case WM_HOTKEY:
