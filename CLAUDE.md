@@ -22,9 +22,9 @@ Linked libraries: `user32.lib`, `gdi32.lib`, `gdiplus.lib`, `ole32.lib`.
 
 Everything lives in `src/main.cpp` (~435 lines). Key subsystems:
 
-- **Layered window** — A `WS_POPUP` window with `WS_EX_LAYERED | WS_EX_TRANSPARENT` for per-pixel alpha and full click-through. Uses `WDA_EXCLUDEFROMCAPTURE` so the lens doesn't capture itself.
-- **Screen capture pipeline** — `StretchBlt` from the screen DC into a capture buffer, composited through GDI+ with a circular clip path, then alpha-blended with a cached border overlay. Final output via `UpdateLayeredWindow`.
-- **Adaptive refresh** — Three-tier timer (60 FPS active → 10 FPS idle → 4 FPS sleep) based on cursor movement detection. The timer interval adjusts dynamically to reduce CPU when the cursor is still.
+- **Layered window** — A `WS_POPUP` window with `WS_EX_LAYERED | WS_EX_TRANSPARENT` for per-pixel alpha and full click-through. Uses `WDA_EXCLUDEFROMCAPTURE` so the lens doesn't capture itself; falls back to per-window capture via `EnumWindows` + `GetWindowDC` when the API is unavailable (e.g. layered window limitation on some Win10 systems).
+- **Screen capture pipeline** — Two paths: (1) direct `StretchBlt` from screen DC when `WDA_EXCLUDEFROMCAPTURE` works, (2) per-window composition that enumerates visible windows in Z-order, captures each via `GetWindowDC`/`BitBlt`, skipping the lens, then zooms via `StretchBlt`. Both feed into the same circular mask + border compositing.
+- **Refresh** — Fixed 60 FPS timer (~16ms).
 - **Input handling** — Low-level mouse hook (`WH_MOUSE_LL`) for right-click drag repositioning and mouse wheel zoom. Global hotkeys via `RegisterHotKey` for toggle (`Ctrl+Alt+M`), zoom (`Ctrl+Alt+±`), and quit (`Ctrl+Alt+Q`).
 - **Border cache** — The decorative border/crosshair/zoom label is pre-rendered to a separate DIB and only redrawn when zoom changes, then manually alpha-composited each frame.
 
@@ -37,3 +37,8 @@ Everything lives in `src/main.cpp` (~435 lines). Key subsystems:
 | Ctrl+Alt+Q | Quit |
 | Mouse wheel over lens | Zoom in/out (0.25x steps) |
 | Right-click drag on lens | Reposition |
+
+## TODO
+
+- [ ] **Click-through pass-through** — Currently `WS_EX_TRANSPARENT` makes ALL clicks pass through the lens. Need selective behavior: clicks on the lens border/UI elements should be handled (drag), clicks on the magnified content area should pass through to the underlying window at the correct (un-magnified) screen coordinate. Requires removing `WS_EX_TRANSPARENT`, performing hit-testing in `WndProc` via `WM_NCHITTEST` (return `HTTRANSPARENT` for content area, `HTCLIENT` for border/drag zones), and forwarding clicks to the correct target window.
+- [ ] **Touch/pen input support** — Add `WM_TOUCH` or `WM_POINTER` message handling for touchscreen interaction. Key tasks: register for touch with `RegisterTouchWindow`, handle `WM_POINTERDOWN`/`WM_POINTERUPDATE`/`WM_POINTERUP` for drag gestures, implement pinch-to-zoom via multi-touch tracking (two-finger distance delta → zoom adjustment), and ensure touch events on the content area pass through to underlying windows (similar to click-through issue above).
