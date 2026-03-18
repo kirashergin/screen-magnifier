@@ -181,12 +181,26 @@ void CaptureByWindowEnum(int cx, int cy, int srcSize) {
         int dstX  = inter.left - srcRect.left;
         int dstY  = inter.top  - srcRect.top;
 
-        HDC hWndDC = GetWindowDC(hwnd);
-        if (hWndDC) {
-            BitBlt(g_hCompDC, dstX, dstY, w, h,
-                   hWndDC, wxSrc, wySrc, SRCCOPY);
-            ReleaseDC(hwnd, hWndDC);
+        // PrintWindow with PW_RENDERFULLCONTENT captures DX/GL content
+        // that returns black via GetWindowDC/BitBlt on Win10.
+        int wndW = wr.right - wr.left;
+        int wndH = wr.bottom - wr.top;
+        HDC hTmpDC = CreateCompatibleDC(g_hCompDC);
+        HBITMAP hTmpBmp = CreateCompatibleBitmap(g_hScreenDC, wndW, wndH);
+        HGDIOBJ hOld = SelectObject(hTmpDC, hTmpBmp);
+
+        if (!PrintWindow(hwnd, hTmpDC, 0x00000002)) {
+            HDC hWndDC = GetWindowDC(hwnd);
+            if (hWndDC) {
+                BitBlt(hTmpDC, 0, 0, wndW, wndH, hWndDC, 0, 0, SRCCOPY);
+                ReleaseDC(hwnd, hWndDC);
+            }
         }
+
+        BitBlt(g_hCompDC, dstX, dstY, w, h, hTmpDC, wxSrc, wySrc, SRCCOPY);
+        SelectObject(hTmpDC, hOld);
+        DeleteObject(hTmpBmp);
+        DeleteDC(hTmpDC);
     }
 
     // 4. Zoom: composition buffer (srcSize²) → capture buffer (d²)
